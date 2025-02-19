@@ -11,6 +11,7 @@
 #include <linux/skbuff.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/sched/isolation.h>
 #include <net/ip_tunnels.h>
 
 struct wg_device;
@@ -112,6 +113,8 @@ static inline int wg_cpumask_choose_online(int *stored_cpu, unsigned int id)
 		cpu = cpumask_first(cpu_online_mask);
 		for (i = 0; i < cpu_index; ++i)
 			cpu = cpumask_next(cpu, cpu_online_mask);
+		while (!housekeeping_cpu(cpu, HK_TYPE_DOMAIN))
+			cpu = cpumask_next(cpu, cpu_online_mask) % nr_cpumask_bits;
 		*stored_cpu = cpu;
 	}
 	return cpu;
@@ -128,8 +131,10 @@ static inline int wg_cpumask_next_online(int *next)
 {
 	int cpu = *next;
 
-	while (unlikely(!cpumask_test_cpu(cpu, cpu_online_mask)))
+	while (unlikely(!cpumask_test_cpu(cpu, cpu_online_mask)) ||
+			!housekeeping_cpu(cpu, HK_TYPE_DOMAIN))
 		cpu = cpumask_next(cpu, cpu_online_mask) % nr_cpumask_bits;
+
 	*next = cpumask_next(cpu, cpu_online_mask) % nr_cpumask_bits;
 	return cpu;
 }
