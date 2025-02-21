@@ -338,7 +338,12 @@ static void xlnx_fbdev_defio_fini(struct fb_info *fbi)
  */
 void xlnx_fb_fini(struct drm_fb_helper *fb_helper)
 {
-	struct xlnx_fbdev *fbdev = to_fbdev(fb_helper);
+	struct xlnx_fbdev *fbdev;
+
+	if (!fb_helper)
+		return;
+
+	fbdev = to_fbdev(fb_helper);
 
 	drm_fb_helper_unregister_fbi(&fbdev->fb_helper);
 	if (fbdev->fb_helper.fbdev)

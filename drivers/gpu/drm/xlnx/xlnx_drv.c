@@ -229,13 +229,13 @@ static int xlnx_bind(struct device *dev)
 		goto err_drm;
 	}
 
-	drm_mode_config_init(drm);
+	drmm_mode_config_init(drm);
 	drm->mode_config.funcs = &xlnx_mode_config_funcs;
 
 	ret = drm_vblank_init(drm, MAX_CRTC);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to initialize vblank\n");
-		goto err_xlnx_drm;
+		goto err_drm;
 	}
 
 	drm->dev_private = xlnx_drm;
@@ -247,7 +247,7 @@ static int xlnx_bind(struct device *dev)
 	xlnx_drm->crtc = xlnx_crtc_helper_init(drm);
 	if (IS_ERR(xlnx_drm->crtc)) {
 		ret = PTR_ERR(xlnx_drm->crtc);
-		goto err_xlnx_drm;
+		goto err_drm;
 	}
 
 	ret = component_bind_all(&master->dev, drm);
@@ -283,13 +283,10 @@ static int xlnx_bind(struct device *dev)
 	return 0;
 
 err_fb:
-	if (xlnx_drm->fb)
-		xlnx_fb_fini(xlnx_drm->fb);
+	xlnx_fb_fini(xlnx_drm->fb);
 	component_unbind_all(drm->dev, drm);
 err_crtc:
 	xlnx_crtc_helper_fini(drm, xlnx_drm->crtc);
-err_xlnx_drm:
-	drm_mode_config_cleanup(drm);
 err_drm:
 	drm_dev_put(drm);
 	return ret;
@@ -301,14 +298,11 @@ static void xlnx_unbind(struct device *dev)
 	struct drm_device *drm = xlnx_drm->drm;
 
 	drm_dev_unregister(drm);
-	component_unbind_all(&xlnx_drm->master->dev, drm);
-	if (xlnx_drm->fb) {
-		xlnx_fb_fini(xlnx_drm->fb);
-		xlnx_drm->fb = NULL;
-	}
-	xlnx_crtc_helper_fini(drm, xlnx_drm->crtc);
 	drm_kms_helper_poll_fini(drm);
-	drm_mode_config_cleanup(drm);
+	drm_atomic_helper_shutdown(drm);
+	component_unbind_all(dev, drm);
+	xlnx_fb_fini(xlnx_drm->fb);
+	xlnx_crtc_helper_fini(drm, xlnx_drm->crtc);
 	drm_dev_put(drm);
 }
 

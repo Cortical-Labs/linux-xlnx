@@ -8,6 +8,8 @@
  *        : Siva Rajesh J <siva.rajesh.jarugula@xilinx.com>
  */
 
+#define DEBUG
+
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
@@ -16,6 +18,7 @@
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_print.h>
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/device.h>
@@ -138,24 +141,7 @@ struct xlnx_dsi {
 	struct device *dev;
 	void __iomem *iomem;
 	struct videomode vm;
-	struct drm_property *eotp_prop;
-	struct drm_property *bllp_mode_prop;
-	struct drm_property *bllp_type_prop;
-	struct drm_property *video_mode_prop;
-	struct drm_property *bllp_burst_time_prop;
-	struct drm_property *cmd_queue_prop;
-	struct drm_property *height_out;
-	struct drm_property *width_out;
-	struct drm_property *in_fmt;
-	struct drm_property *out_fmt;
 	struct xlnx_bridge *bridge;
-	u32 video_mode_prop_val;
-	u32 bllp_burst_time_prop_val;
-	u32 cmd_queue_prop_val;
-	u32 height_out_prop_val;
-	u32 width_out_prop_val;
-	u32 in_fmt_prop_val;
-	u32 out_fmt_prop_val;
 	u32 lanes;
 	u32 mode_flags;
 	u32 mul_factor;
@@ -163,9 +149,6 @@ struct xlnx_dsi {
 	struct clk *dphy_clk_200M;
 	enum mipi_dsi_pixel_format format;
 	bool cmdmode;
-	bool eotp_prop_val;
-	bool bllp_mode_prop_val;
-	bool bllp_type_prop_val;
 };
 
 #define host_to_dsi(host) container_of(host, struct xlnx_dsi, dsi_host)
@@ -182,38 +165,48 @@ static inline u32 xlnx_dsi_readl(void __iomem *base, int offset)
 	return readl(base + offset);
 }
 
-/**
- * xlnx_dsi_set_config_parameters - Configure DSI Tx registers with parameters
- * given from user application.
- * @dsi: DSI structure having the updated user parameters
- *
- * This function takes the DSI structure having drm_property parameters
- * configured from  user application and writes them into DSI IP registers.
- */
-static void xlnx_dsi_set_config_parameters(struct xlnx_dsi *dsi)
+// https://docs.amd.com/r/en-US/pg238-mipi-dsi-tx/Case-4-Enabling-the-Core-in-Video/Command-Mode
+
+static void xlnx_dsi_enter_command_mode(struct xlnx_dsi *dsi)
 {
-	u32 reg;
+	dev_dbg(dsi->dev, "%s\n", __func__);
+	if (dsi->cmdmode)
+	{
+		u32 reg;
 
-	reg = XDSI_PCR_EOTPENABLE(dsi->eotp_prop_val);
-	reg |= XDSI_PCR_VIDEOMODE(dsi->video_mode_prop_val);
-	reg |= XDSI_PCR_BLLPTYPE(dsi->bllp_type_prop_val);
-	reg |= XDSI_PCR_BLLPMODE(dsi->bllp_mode_prop_val);
+		reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
+		if (!(reg & XDSI_CCR_CMDMODE) && (reg & XDSI_CCR_COREENB))
+		{
+			dev_dbg(dsi->dev, "Timing parameters are wiped out!%s\n", __func__);
 
-	xlnx_dsi_writel(dsi->iomem, XDSI_PCR, reg);
-	/*
-	 * Configure the burst time if video mode is burst.
-	 * HSA of TIME1 register is ignored in this mode.
-	 */
-	if (dsi->video_mode_prop_val == XDSI_VIDEO_MODE_BURST) {
-		reg = XDSI_TIME1_BLLP_BURST(dsi->bllp_burst_time_prop_val);
-		xlnx_dsi_writel(dsi->iomem, XDSI_TIME1, reg);
+			reg &= ~XDSI_CCR_COREENB;
+			xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+		}
+		reg |= XDSI_CCR_CMDMODE | XDSI_CCR_COREENB;
+		xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
 	}
+}
 
-	reg = XDSI_CMD_QUEUE_PACKET(dsi->cmd_queue_prop_val);
-	xlnx_dsi_writel(dsi->iomem, XDSI_CMD, reg);
+static void xlnx_dsi_enter_video_mode(struct xlnx_dsi *dsi)
+{
+	dev_dbg(dsi->dev, "%s\n", __func__);
+	if (dsi->cmdmode)
+	{
+		u32 reg;
 
-	dev_dbg(dsi->dev, "PCR register value is = %x\n",
-		xlnx_dsi_readl(dsi->iomem, XDSI_PCR));
+		reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
+		if ((reg & XDSI_CCR_CMDMODE) && (reg & XDSI_CCR_COREENB))
+		{
+			// wait for command queue to empty
+			while (xlnx_dsi_readl(dsi->iomem, XDSI_STR) & XDSI_STR_CMD_EXE_PGS)
+			{
+				fsleep(1000);
+			}
+		}
+		reg &= ~XDSI_CCR_CMDMODE;
+		reg |= XDSI_CCR_COREENB;
+		xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+	}
 }
 
 /**
@@ -228,11 +221,14 @@ static void xlnx_dsi_set_display_mode(struct xlnx_dsi *dsi)
 	struct videomode *vm = &dsi->vm;
 	u32 reg, video_mode;
 
+	dev_dbg(dsi->dev, "%s\n", __func__);
+
+	// are we in burst or non-burst mode?
 	reg = xlnx_dsi_readl(dsi->iomem, XDSI_PCR);
 	video_mode = (reg & XDSI_PCR_VIDEOMODE_MASK) >>
 		      XDSI_PCR_VIDEOMODE_SHIFT;
 
-	/* configure the HSA value only if non_burst_sync_pluse video mode */
+	/* configure the HSA value only if non_burst_sync_pulse video mode */
 	if (!video_mode &&
 	    (dsi->mode_flags & MIPI_DSI_MODE_VIDEO_SYNC_PULSE)) {
 		reg = XDSI_TIME1_HSA(vm->hsync_len);
@@ -282,11 +278,30 @@ static void xlnx_dsi_set_display_mode(struct xlnx_dsi *dsi)
 static void xlnx_dsi_set_display_enable(struct xlnx_dsi *dsi)
 {
 	u32 reg;
+	int ret;
 
-	reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
-	reg |= XDSI_CCR_COREENB;
+	dev_dbg(dsi->dev, "%s\n", __func__);
 
-	xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+	if (!dsi->panel)
+	{
+		dev_err(dsi->dev, "Panel not found\n");
+		return;
+	}
+
+	xlnx_dsi_enter_command_mode(dsi);
+
+	ret = drm_panel_prepare(dsi->panel);
+	if (ret)
+	{
+		dev_err(dsi->dev, "Panel prepare failed\n");
+	}
+	else
+	{
+		drm_panel_enable(dsi->panel);
+	}
+
+	xlnx_dsi_enter_video_mode(dsi);
+
 	dev_dbg(dsi->dev, "MIPI DSI Tx controller is enabled.\n");
 }
 
@@ -302,96 +317,21 @@ static void xlnx_dsi_set_display_disable(struct xlnx_dsi *dsi)
 {
 	u32 reg;
 
+	dev_dbg(dsi->dev, "%s\n", __func__);
+
+	xlnx_dsi_enter_command_mode(dsi);
+
+	if (dsi->panel)
+	{
+		drm_panel_disable(dsi->panel);
+		//drm_panel_unprepare(dsi->panel);
+	}
+
 	reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
-	reg &= ~XDSI_CCR_COREENB;
+	reg &= ~(XDSI_CCR_COREENB|XDSI_CCR_CMDMODE);
 
 	xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
 	dev_dbg(dsi->dev, "DSI Tx is disabled. reset regs to default values\n");
-}
-
-/**
- * xlnx_dsi_atomic_set_property - implementation of drm_connector_funcs
- * set_property invoked by IOCTL call to DRM_IOCTL_MODE_OBJ_SETPROPERTY
- *
- * @connector: pointer Xilinx DSI connector
- * @state: DRM connector state
- * @prop: pointer to the drm_property structure
- * @val: DSI parameter value that is configured from user application
- *
- * This function takes a drm_property name and value given from user application
- * and update the DSI structure property varabiles with the values.
- * These values are later used to configure the DSI Rx IP.
- *
- * Return: 0 on success OR -EINVAL if setting property fails
- */
-static int xlnx_dsi_atomic_set_property(struct drm_connector *connector,
-					struct drm_connector_state *state,
-					struct drm_property *prop, u64 val)
-{
-	struct xlnx_dsi *dsi = connector_to_dsi(connector);
-
-	dev_dbg(dsi->dev, "property name = %s, value = %lld\n",
-		prop->name, val);
-
-	if (prop == dsi->eotp_prop)
-		dsi->eotp_prop_val = !!val;
-	else if (prop == dsi->bllp_mode_prop)
-		dsi->bllp_mode_prop_val = !!val;
-	else if (prop == dsi->bllp_type_prop)
-		dsi->bllp_type_prop_val = !!val;
-	else if (prop == dsi->video_mode_prop)
-		dsi->video_mode_prop_val = (unsigned int)val;
-	else if (prop == dsi->bllp_burst_time_prop)
-		dsi->bllp_burst_time_prop_val = (unsigned int)val;
-	else if (prop == dsi->cmd_queue_prop)
-		dsi->cmd_queue_prop_val = (unsigned int)val;
-	else if (prop == dsi->height_out)
-		dsi->height_out_prop_val = (u32)val;
-	else if (prop == dsi->width_out)
-		dsi->width_out_prop_val = (u32)val;
-	else if (prop == dsi->in_fmt)
-		dsi->in_fmt_prop_val = (u32)val;
-	else if (prop == dsi->out_fmt)
-		dsi->out_fmt_prop_val = (u32)val;
-	else
-		return -EINVAL;
-
-	xlnx_dsi_set_config_parameters(dsi);
-
-	return 0;
-}
-
-static int
-xlnx_dsi_atomic_get_property(struct drm_connector *connector,
-			     const struct drm_connector_state *state,
-			     struct drm_property *prop, uint64_t *val)
-{
-	struct xlnx_dsi *dsi = connector_to_dsi(connector);
-
-	if (prop == dsi->eotp_prop)
-		*val = dsi->eotp_prop_val;
-	else if (prop == dsi->bllp_mode_prop)
-		*val = dsi->bllp_mode_prop_val;
-	else if (prop == dsi->bllp_type_prop)
-		*val = dsi->bllp_type_prop_val;
-	else if (prop == dsi->video_mode_prop)
-		*val = dsi->video_mode_prop_val;
-	else if (prop == dsi->bllp_burst_time_prop)
-		*val = dsi->bllp_burst_time_prop_val;
-	else if (prop == dsi->cmd_queue_prop)
-		*val = dsi->cmd_queue_prop_val;
-	else if (prop == dsi->height_out)
-		*val = dsi->height_out_prop_val;
-	else if (prop == dsi->width_out)
-		*val = dsi->width_out_prop_val;
-	else if (prop == dsi->in_fmt)
-		*val = dsi->in_fmt_prop_val;
-	else if (prop == dsi->out_fmt)
-		*val = dsi->out_fmt_prop_val;
-	else
-		return -EINVAL;
-
-	return 0;
 }
 
 /**
@@ -409,7 +349,7 @@ static ssize_t xlnx_dsi_host_transfer(struct mipi_dsi_host *host,
 				      const struct mipi_dsi_msg *msg)
 {
 	struct xlnx_dsi *dsi = host_to_dsi(host);
-	u32 data0, data1, cmd0, val, offset;
+	u32 data0, data1, cmd0, val, offset, i;
 	int status;
 	const char *tx_buf = msg->tx_buf;
 
@@ -423,10 +363,19 @@ static ssize_t xlnx_dsi_host_transfer(struct mipi_dsi_host *host,
 			dev_err(dsi->dev, "long cmd fifo not empty!\n");
 			return -ETIMEDOUT;
 		}
+
 		data0 = tx_buf[0] | (tx_buf[1] << 8) | (tx_buf[2] << 16) |
 			(tx_buf[3] << 24);
-		data1 = tx_buf[4] | (tx_buf[5] << 8);
-		cmd0 = msg->type | (MIPI_DSI_DCS_READ << 8);
+
+		data1 = 0;
+		if (msg->tx_len == 5) {
+			data1 = tx_buf[4];
+		}
+		else if (msg->tx_len == 6) {
+			data1 = tx_buf[4] | (tx_buf[5] << 8);
+		}
+
+		cmd0 = msg->type | (6 << 8);
 
 		xlnx_dsi_writel(dsi->iomem, XDSI_DFR, data0);
 		xlnx_dsi_writel(dsi->iomem, XDSI_DFR, data1);
@@ -501,6 +450,9 @@ static int xlnx_dsi_host_attach(struct mipi_dsi_host *host,
 	panel_lanes = device->lanes;
 	dsi->mode_flags = device->mode_flags;
 	dsi->panel_node = device->dev.of_node;
+	dsi->panel = of_drm_find_panel(dsi->panel_node);
+
+	dev_dbg(dsi->dev, "%s\n", __func__);
 
 	if (panel_lanes != dsi->lanes) {
 		dev_err(dsi->dev, "Mismatch of lanes. panel = %d, DSI = %d\n",
@@ -545,62 +497,18 @@ static const struct mipi_dsi_host_ops xlnx_dsi_ops = {
 	.transfer = xlnx_dsi_host_transfer,
 };
 
-static int xlnx_dsi_connector_dpms(struct drm_connector *connector, int mode)
-{
-	struct xlnx_dsi *dsi = connector_to_dsi(connector);
-	int ret;
-
-	dev_dbg(dsi->dev, "connector dpms state: %d\n", mode);
-
-	switch (mode) {
-	case DRM_MODE_DPMS_ON:
-		ret = drm_panel_prepare(dsi->panel);
-		if (ret < 0) {
-			dev_err(dsi->dev, "DRM panel not found\n");
-			return ret;
-		}
-
-		ret = drm_panel_enable(dsi->panel);
-		if (ret < 0) {
-			drm_panel_unprepare(dsi->panel);
-			dev_err(dsi->dev, "DRM panel not enabled\n");
-			return ret;
-		}
-		break;
-	default:
-		drm_panel_disable(dsi->panel);
-		drm_panel_unprepare(dsi->panel);
-		break;
-	}
-
-	return drm_helper_connector_dpms(connector, mode);
-}
-
 static enum drm_connector_status
 xlnx_dsi_detect(struct drm_connector *connector, bool force)
 {
 	struct xlnx_dsi *dsi = connector_to_dsi(connector);
+	int ret;
 
-	if (!dsi->panel) {
-		dsi->panel = of_drm_find_panel(dsi->panel_node);
-		if (dsi->panel) {
-			if (dsi->cmdmode) {
-				xlnx_dsi_writel(dsi->iomem, XDSI_CCR,
-						XDSI_CCR_CMDMODE |
-						XDSI_CCR_COREENB);
-				drm_panel_prepare(dsi->panel);
-				xlnx_dsi_writel(dsi->iomem, XDSI_CCR, 0);
-			}
-		}
-	} else if (!dsi->panel_node) {
-		xlnx_dsi_connector_dpms(connector, DRM_MODE_DPMS_OFF);
-		dsi->panel = NULL;
-	}
+	dev_dbg(dsi->dev, "%s\n", __func__);
 
-	if (dsi->panel)
-		return connector_status_connected;
+	if (!dsi->panel)
+		return connector_status_disconnected;
 
-	return connector_status_disconnected;
+	return connector_status_connected;
 }
 
 static void xlnx_dsi_connector_destroy(struct drm_connector *connector)
@@ -611,12 +519,9 @@ static void xlnx_dsi_connector_destroy(struct drm_connector *connector)
 }
 
 static const struct drm_connector_funcs xlnx_dsi_connector_funcs = {
-	.dpms = xlnx_dsi_connector_dpms,
 	.detect = xlnx_dsi_detect,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.destroy = xlnx_dsi_connector_destroy,
-	.atomic_set_property = xlnx_dsi_atomic_set_property,
-	.atomic_get_property = xlnx_dsi_atomic_get_property,
 	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
 	.reset			= drm_atomic_helper_connector_reset,
@@ -624,100 +529,25 @@ static const struct drm_connector_funcs xlnx_dsi_connector_funcs = {
 
 static int xlnx_dsi_get_modes(struct drm_connector *connector)
 {
+	if (!connector)
+	{
+		pr_err("connector is NULL\n");
+		return -EINVAL;
+	}
+
 	struct xlnx_dsi *dsi = connector_to_dsi(connector);
 
-	if (dsi->panel)
+	if (dsi->panel && dsi->panel->funcs && dsi->panel->funcs->get_modes)
 		return dsi->panel->funcs->get_modes(dsi->panel, connector);
 
 	return 0;
 }
 
-static struct drm_encoder *
-xlnx_dsi_best_encoder(struct drm_connector *connector)
-{
-	return &(connector_to_dsi(connector)->encoder);
-}
 
 static struct drm_connector_helper_funcs xlnx_dsi_connector_helper_funcs = {
 	.get_modes = xlnx_dsi_get_modes,
-	.best_encoder = xlnx_dsi_best_encoder,
 };
 
-/**
- * xlnx_dsi_connector_create_property -  create DSI connector properties
- *
- * @connector: pointer to Xilinx DSI connector
- *
- * This function takes the xilinx DSI connector component and defines
- * the drm_property variables with their default values.
- */
-static void xlnx_dsi_connector_create_property(struct drm_connector *connector)
-{
-	struct drm_device *dev = connector->dev;
-	struct xlnx_dsi *dsi  = connector_to_dsi(connector);
-
-	dsi->eotp_prop = drm_property_create_bool(dev, 0, "eotp");
-	dsi->video_mode_prop = drm_property_create_range(dev, 0, "video_mode",
-							 0, 2);
-	dsi->bllp_mode_prop = drm_property_create_bool(dev, 0, "bllp_mode");
-	dsi->bllp_type_prop = drm_property_create_bool(dev, 0, "bllp_type");
-	dsi->bllp_burst_time_prop =
-		drm_property_create_range(dev, 0, "bllp_burst_time", 0, 0xFFFF);
-	dsi->cmd_queue_prop = drm_property_create_range(dev, 0, "cmd_queue", 0,
-							0xffffff);
-	dsi->height_out = drm_property_create_range(dev, 0, "height_out",
-						    2, 4096);
-	dsi->width_out = drm_property_create_range(dev, 0, "width_out",
-						   2, 4096);
-	dsi->in_fmt = drm_property_create_range(dev, 0, "in_fmt", 0, 16384);
-	dsi->out_fmt = drm_property_create_range(dev, 0, "out_fmt", 0, 16384);
-}
-
-/**
- * xlnx_dsi_connector_attach_property -  attach DSI connector
- * properties
- *
- * @connector: pointer to Xilinx DSI connector
- */
-static void xlnx_dsi_connector_attach_property(struct drm_connector *connector)
-{
-	struct xlnx_dsi *dsi = connector_to_dsi(connector);
-	struct drm_mode_object *obj = &connector->base;
-
-	if (dsi->eotp_prop)
-		drm_object_attach_property(obj, dsi->eotp_prop, 1);
-
-	if (dsi->video_mode_prop)
-		drm_object_attach_property(obj, dsi->video_mode_prop, 0);
-
-	if (dsi->bllp_burst_time_prop)
-		drm_object_attach_property(&connector->base,
-					   dsi->bllp_burst_time_prop, 0);
-
-	if (dsi->bllp_mode_prop)
-		drm_object_attach_property(&connector->base,
-					   dsi->bllp_mode_prop, 0);
-
-	if (dsi->bllp_type_prop)
-		drm_object_attach_property(&connector->base,
-					   dsi->bllp_type_prop, 0);
-
-	if (dsi->cmd_queue_prop)
-		drm_object_attach_property(&connector->base,
-					   dsi->cmd_queue_prop, 0);
-
-	if (dsi->height_out)
-		drm_object_attach_property(obj, dsi->height_out, 0);
-
-	if (dsi->width_out)
-		drm_object_attach_property(obj, dsi->width_out, 0);
-
-	if (dsi->in_fmt)
-		drm_object_attach_property(obj, dsi->in_fmt, 0);
-
-	if (dsi->out_fmt)
-		drm_object_attach_property(obj, dsi->out_fmt, 0);
-}
 
 static int xlnx_dsi_create_connector(struct drm_encoder *encoder)
 {
@@ -725,7 +555,9 @@ static int xlnx_dsi_create_connector(struct drm_encoder *encoder)
 	struct drm_connector *connector = &dsi->connector;
 	int ret;
 
-	connector->polled = DRM_CONNECTOR_POLL_HPD;
+	dev_dbg(dsi->dev, "%s\n", __func__);
+
+	connector->polled = 0; // DRM_CONNECTOR_POLL_HPD;
 
 	ret = drm_connector_init(encoder->dev, connector,
 				 &xlnx_dsi_connector_funcs,
@@ -738,8 +570,6 @@ static int xlnx_dsi_create_connector(struct drm_encoder *encoder)
 	drm_connector_helper_add(connector, &xlnx_dsi_connector_helper_funcs);
 	drm_connector_register(connector);
 	drm_connector_attach_encoder(connector, encoder);
-	xlnx_dsi_connector_create_property(connector);
-	xlnx_dsi_connector_attach_property(connector);
 
 	return 0;
 }
@@ -763,13 +593,9 @@ xlnx_dsi_atomic_mode_set(struct drm_encoder *encoder,
 	struct videomode *vm = &dsi->vm;
 	struct drm_display_mode *m = &crtc_state->adjusted_mode;
 
+	dev_dbg(dsi->dev, "%s\n", __func__);
+
 	/* Set bridge input and output parameters */
-	xlnx_bridge_set_input(dsi->bridge, m->hdisplay, m->vdisplay,
-			      dsi->in_fmt_prop_val);
-	xlnx_bridge_set_output(dsi->bridge, dsi->width_out_prop_val,
-			       dsi->height_out_prop_val,
-			       dsi->out_fmt_prop_val);
-	xlnx_bridge_enable(dsi->bridge);
 
 	vm->hactive = m->hdisplay;
 	vm->vactive = m->vdisplay;
@@ -886,6 +712,8 @@ static int xlnx_dsi_bind(struct device *dev, struct device *master,
 	struct drm_encoder *encoder = &dsi->encoder;
 	struct drm_device *drm_dev = data;
 	int ret;
+
+	dev_dbg(dsi->dev, "%s\n", __func__);
 
 	/*
 	 * TODO: The possible CRTCs are 1 now as per current implementation of
