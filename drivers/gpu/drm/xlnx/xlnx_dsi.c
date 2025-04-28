@@ -26,6 +26,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
+#include <linux/reset.h>
 #include <video/mipi_display.h>
 #include <video/videomode.h>
 
@@ -93,6 +94,12 @@
 /* command timeout in usec */
 #define XDSI_CMD_TIMEOUT_VAL	(3000)
 
+/* D-PHY registers */
+#define XDSI_DPHY_OFFSET 	0x10000
+#define XDSI_DPHY_CONTROL	(XDSI_DPHY_OFFSET + 0x00)
+#define XDSI_DPHY_SOFTRST	BIT(0)
+#define XDSI_DPHY_COREENB	BIT(1)
+
 /**
  * struct xlnx_dsi - Core configuration DSI Tx subsystem device structure
  * @encoder: DRM encoder structure
@@ -149,6 +156,7 @@ struct xlnx_dsi {
 	struct clk *dphy_clk_200M;
 	enum mipi_dsi_pixel_format format;
 	bool cmdmode;
+	struct reset_control *reset;
 };
 
 #define host_to_dsi(host) container_of(host, struct xlnx_dsi, dsi_host)
@@ -157,56 +165,249 @@ struct xlnx_dsi {
 
 static inline void xlnx_dsi_writel(void __iomem *base, int offset, u32 val)
 {
+	// pr_err("Writing to 0x%02x: 0x%x\n", offset, val);
 	writel(val, base + offset);
 }
 
 static inline u32 xlnx_dsi_readl(void __iomem *base, int offset)
 {
-	return readl(base + offset);
+	u32 val = readl(base + offset);
+	// pr_err("Read from 0x%02x: 0x%x\n", offset, val);
+	return val;
+}
+
+static inline void xlnx_dsi_writel_set_bits(void __iomem *base, int offset, u32 mask)
+{
+	u32 val;
+	val = xlnx_dsi_readl(base, offset);
+	val |= mask;
+	xlnx_dsi_writel(base, offset, val);
+}
+
+static inline void xlnx_dsi_writel_clear_bits(void __iomem *base, int offset, u32 mask)
+{
+	u32 val;
+	val = xlnx_dsi_readl(base, offset);
+	val &= ~mask;
+	xlnx_dsi_writel(base, offset, val);
+}
+
+
+static void register_dump(struct xlnx_dsi *dsi)
+{
+	int i;
+	u32 val;
+
+	dev_dbg(dsi->dev, "%s MIPI registers:\n", __func__);
+
+	val = xlnx_dsi_readl(dsi->iomem, 0x00);
+	dev_dbg(dsi->dev, "%s 0x00 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x04);
+	dev_dbg(dsi->dev, "%s 0x04 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x20);
+	dev_dbg(dsi->dev, "%s 0x20 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x24);
+	dev_dbg(dsi->dev, "%s 0x24 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x28);
+	dev_dbg(dsi->dev, "%s 0x28 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x2C);
+	dev_dbg(dsi->dev, "%s 0x2C = %x\n", __func__, val);
+
+	val = xlnx_dsi_readl(dsi->iomem, 0x50);
+	dev_dbg(dsi->dev, "%s 0x50 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x54);
+	dev_dbg(dsi->dev, "%s 0x54 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x58);
+	dev_dbg(dsi->dev, "%s 0x58 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x5C);
+	dev_dbg(dsi->dev, "%s 0x5C = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x60);
+	dev_dbg(dsi->dev, "%s 0x60 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x64);
+	dev_dbg(dsi->dev, "%s 0x64 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x68);
+	dev_dbg(dsi->dev, "%s 0x68 = %x\n", __func__, val);
+	val = xlnx_dsi_readl(dsi->iomem, 0x6C);
+	dev_dbg(dsi->dev, "%s 0x6C = %x\n", __func__, val);
+
+	dev_dbg(dsi->dev, "%s DPHY registers:\n", __func__);
+	for (i = 0; i <= 0x74; i += 4)
+	{
+		val = xlnx_dsi_readl(dsi->iomem, XDSI_DPHY_OFFSET + i);
+		dev_dbg(dsi->dev, "%s 0x%02x = %x\n", __func__, XDSI_DPHY_OFFSET + i, val);
+	}	
 }
 
 // https://docs.amd.com/r/en-US/pg238-mipi-dsi-tx/Case-4-Enabling-the-Core-in-Video/Command-Mode
 
 static void xlnx_dsi_enter_command_mode(struct xlnx_dsi *dsi)
 {
+	int status;
+
 	dev_dbg(dsi->dev, "%s\n", __func__);
 	if (dsi->cmdmode)
 	{
+		// Command Mode
+
+        // If core_en = 1 and command_mode = 0
+        //     Disable the core, make core enable 0
+        //     Enable command mode
+        //     Enable Core
+		// If core_en = 0: Enable bits 3 and 0 in Core Configuration Register (0x0)
+        
 		u32 reg;
 
 		reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
-		if (!(reg & XDSI_CCR_CMDMODE) && (reg & XDSI_CCR_COREENB))
+		if (reg & XDSI_CCR_COREENB)
 		{
-			dev_dbg(dsi->dev, "Timing parameters are wiped out!%s\n", __func__);
+			dev_dbg(dsi->dev, "%s core is already enabled\n", __func__);
+			if (reg & XDSI_CCR_CMDMODE)
+			{
+				dev_dbg(dsi->dev, "%s command mode is already enabled\n", __func__);
+			}
+			else
+			{
+				dev_dbg(dsi->dev, "%s command mode is NOT already enabled, disabling core\n", __func__);	
+				reg &= ~XDSI_CCR_COREENB;
+				xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
 
-			reg &= ~XDSI_CCR_COREENB;
+				dev_dbg(dsi->dev, "%s waiting for controller to be ready\n", __func__);
+				status = readl_poll_timeout(dsi->iomem + XDSI_CCR, reg,
+				    (reg & XDSI_CCR_CRREADY),
+					1,
+				    XDSI_CMD_TIMEOUT_VAL);
+				if (status) {
+					dev_err(dsi->dev, "timeout waiting for controller ready\n");
+					return;
+				}
+
+				dev_dbg(dsi->dev, "%s enabling command mode\n", __func__);
+				reg |= XDSI_CCR_CMDMODE;
+				xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+
+				dev_dbg(dsi->dev, "%s enabling core\n", __func__);
+				reg |= XDSI_CCR_COREENB;
+				xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+			}
+		}
+		else
+		{
+			dev_dbg(dsi->dev, "%s core was NOT enabled, waiting for controller to be ready\n", __func__);
+			status = readl_poll_timeout(dsi->iomem + XDSI_CCR, reg,
+				(reg & XDSI_CCR_CRREADY),
+				1,
+				XDSI_CMD_TIMEOUT_VAL);
+			if (status) {
+				dev_err(dsi->dev, "timeout waiting for controller ready\n");
+				return;
+			}
+
+			dev_dbg(dsi->dev, "%s enabling command mode\n", __func__);
+			reg |= XDSI_CCR_CMDMODE;
+			xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+
+			dev_dbg(dsi->dev, "%s enabling core\n", __func__);
+			reg |= XDSI_CCR_COREENB;
 			xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
 		}
-		reg |= XDSI_CCR_CMDMODE | XDSI_CCR_COREENB;
-		xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+
+		// if (!(reg & XDSI_CCR_CMDMODE) && (reg & XDSI_CCR_COREENB))
+		// {
+		// 	dev_dbg(dsi->dev, "Timing parameters are wiped out!%s\n", __func__);
+
+		// 	reg &= ~XDSI_CCR_COREENB;
+		// 	xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+		// }
+		// reg |= XDSI_CCR_CMDMODE | XDSI_CCR_COREENB;
+		// xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
 	}
+
+	return;
 }
 
 static void xlnx_dsi_enter_video_mode(struct xlnx_dsi *dsi)
 {
+	int status;
+
 	dev_dbg(dsi->dev, "%s\n", __func__);
 	if (dsi->cmdmode)
 	{
 		u32 reg;
 
+		// Video Mode
+
+        // If core_en = 1 and command_mode = 1
+        //     Wait for command execution in progress (bit 11 of 0x2C) to be 0
+        //     Ensure timing registers are programmed
+        //     Make command mode = 0
+		// If core_en = 0:
+        //     Program required Timing Registers
+        //     Make core_en = 1 and command mode bit = 0
+
 		reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
-		if ((reg & XDSI_CCR_CMDMODE) && (reg & XDSI_CCR_COREENB))
+		if (reg & XDSI_CCR_COREENB)
 		{
-			// wait for command queue to empty
-			while (xlnx_dsi_readl(dsi->iomem, XDSI_STR) & XDSI_STR_CMD_EXE_PGS)
+			dev_dbg(dsi->dev, "%s core is already enabled\n", __func__);
+			if (reg & XDSI_CCR_CMDMODE)
 			{
-				fsleep(1000);
+				dev_dbg(dsi->dev, "%s command mode is NOT already disabled, waiting for queue to clear\n", __func__);
+				status = readl_poll_timeout(dsi->iomem + XDSI_STR, reg,
+				    !(reg & XDSI_STR_CMD_EXE_PGS),
+					1,
+				    XDSI_CMD_TIMEOUT_VAL);
+				if (status) {
+					dev_err(dsi->dev, "timeout waiting for command to finish when entering video mode\n");
+					return;
+				}
+				
+				dev_dbg(dsi->dev, "%s disabling command mode\n", __func__);
+				reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
+				reg &= ~XDSI_CCR_CMDMODE;
+				xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+			}
+			else
+			{
+				dev_dbg(dsi->dev, "%s command mode is already disabled\n", __func__);
 			}
 		}
-		reg &= ~XDSI_CCR_CMDMODE;
-		reg |= XDSI_CCR_COREENB;
-		xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+		else
+		{
+			dev_dbg(dsi->dev, "%s core is NOT already enabled, waiting for controller to be ready\n", __func__);
+			status = readl_poll_timeout(dsi->iomem + XDSI_CCR, reg,
+				(reg & XDSI_CCR_CRREADY),
+				1,
+				XDSI_CMD_TIMEOUT_VAL);
+			if (status) {
+				dev_err(dsi->dev, "timeout waiting for controller \n");
+				return;
+			}
+
+			dev_dbg(dsi->dev, "%s ensuring command mode disabled\n", __func__);
+			reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
+			reg &= ~XDSI_CCR_CMDMODE;
+			xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+
+			dev_dbg(dsi->dev, "%s enabling core\n", __func__);
+			reg |= XDSI_CCR_COREENB;
+			xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
+		}
+
+		// reg = xlnx_dsi_readl(dsi->iomem, XDSI_CCR);
+		// if ((reg & XDSI_CCR_CMDMODE) && (reg & XDSI_CCR_COREENB))
+		// {
+		// 	// wait for command queue to empty
+		// 	while (xlnx_dsi_readl(dsi->iomem, XDSI_STR) & XDSI_STR_CMD_EXE_PGS)
+		// 	{
+		// 		fsleep(1000);
+		// 	}
+		// }
+		// reg &= ~XDSI_CCR_CMDMODE;
+		// reg |= XDSI_CCR_COREENB;
+		// xlnx_dsi_writel(dsi->iomem, XDSI_CCR, reg);
 	}
+
+	msleep(100);
+	register_dump(dsi);
 }
 
 /**
@@ -221,7 +422,7 @@ static void xlnx_dsi_set_display_mode(struct xlnx_dsi *dsi)
 	struct videomode *vm = &dsi->vm;
 	u32 reg, video_mode;
 
-	dev_dbg(dsi->dev, "%s\n", __func__);
+	dev_dbg(dsi->dev, "%s IMPORTANT MUST BE IN COMMAND MODE\n", __func__);
 
 	// are we in burst or non-burst mode?
 	reg = xlnx_dsi_readl(dsi->iomem, XDSI_PCR);
@@ -277,8 +478,8 @@ static void xlnx_dsi_set_display_mode(struct xlnx_dsi *dsi)
  */
 static void xlnx_dsi_set_display_enable(struct xlnx_dsi *dsi)
 {
-	u32 reg;
-	int ret;
+	u32 val;
+	int ret, status;
 
 	dev_dbg(dsi->dev, "%s\n", __func__);
 
@@ -288,19 +489,76 @@ static void xlnx_dsi_set_display_enable(struct xlnx_dsi *dsi)
 		return;
 	}
 
+	// dev_dbg(dsi->dev, "%s - asserting reset\n", __func__);
+	// register_dump(dsi);
+
+	// // TODO - not deasserting didn't change the behaviour so it might not be working,.
+	// reset_control_assert(dsi->reset);
+	// // Reset for at least 40 cycles as per docs.
+	// // 1us is 200 cycles at 200MHz and 240 at 240MHz.
+	// msleep(50);
+	// reset_control_deassert(dsi->reset);
+	// msleep(50);
+
+	// Disable both MIPI and DPHY cores
+	xlnx_dsi_writel_clear_bits(dsi->iomem, XDSI_CCR, 			XDSI_CCR_COREENB);
+	xlnx_dsi_writel_clear_bits(dsi->iomem, XDSI_DPHY_CONTROL, 	XDSI_DPHY_COREENB);
+
+	// Soft reset the MIPI core
+	xlnx_dsi_writel_set_bits(dsi->iomem, XDSI_CCR, XDSI_CCR_SOFTRST);
+
+	dev_dbg(dsi->dev, "%s - before first sleep\n", __func__);
+	register_dump(dsi);
+
+	// bris waited for 500ms here
+	msleep(500);
+
+	dev_dbg(dsi->dev, "%s - after first sleep\n", __func__);
+	register_dump(dsi);
+
+	// then he enabled the phy again and waited another 500ms
+	xlnx_dsi_writel_set_bits(dsi->iomem, XDSI_DPHY_CONTROL, XDSI_DPHY_COREENB);
+	msleep(500);
+
+	dev_dbg(dsi->dev, "%s - after second sleep\n", __func__);
+	register_dump(dsi);
+
+	// then waited until the MIPI block was ready.
+	dev_dbg(dsi->dev, "%s waiting for controller to be ready (after reset)\n", __func__);
+	status = readl_poll_timeout(dsi->iomem + XDSI_CCR, val, (val & XDSI_CCR_CRREADY), 1, XDSI_CMD_TIMEOUT_VAL);
+	if (status) {
+		dev_err(dsi->dev, "timeout waiting for controller ready (after reset)\n");
+		return;
+	}
+
+	dev_dbg(dsi->dev, "%s - after MIPI ready\n", __func__);
+	register_dump(dsi);
+
 	xlnx_dsi_enter_command_mode(dsi);
+
+	// Enable interupts
+	// xlnx_dsi_writel(dsi->iomem, XDSI_IER,  0x7);
+	// xlnx_dsi_writel(dsi->iomem, XDSI_GIER, 0x1);
 
 	ret = drm_panel_prepare(dsi->panel);
 	if (ret)
 	{
 		dev_err(dsi->dev, "Panel prepare failed\n");
-	}
-	else
-	{
-		drm_panel_enable(dsi->panel);
+		return;
 	}
 
+	// Apply the timing parameters
+	xlnx_dsi_set_display_mode(dsi);
+
+	dev_dbg(dsi->dev, "Before enable reg dump\n");
+	register_dump(dsi);
+
+	drm_panel_enable(dsi->panel);
+
 	xlnx_dsi_enter_video_mode(dsi);
+
+	dev_dbg(dsi->dev, "Final reg dump\n");
+	register_dump(dsi);
 
 	dev_dbg(dsi->dev, "MIPI DSI Tx controller is enabled.\n");
 }
@@ -349,7 +607,7 @@ static ssize_t xlnx_dsi_host_transfer(struct mipi_dsi_host *host,
 				      const struct mipi_dsi_msg *msg)
 {
 	struct xlnx_dsi *dsi = host_to_dsi(host);
-	u32 data0, data1, cmd0, val, offset, i;
+	u32 data0, data1, cmd0, val, offset;
 	int status;
 	const char *tx_buf = msg->tx_buf;
 
@@ -430,13 +688,14 @@ static ssize_t xlnx_dsi_host_transfer(struct mipi_dsi_host *host,
 		return -EINVAL;
 	}
 
-	status = readl_poll_timeout(dsi->iomem + XDSI_STR, val,
-				    !(val & XDSI_STR_CMD_EXE_PGS), 1,
-				    XDSI_CMD_TIMEOUT_VAL);
-	if (status) {
-		dev_err(dsi->dev, "cmd timeout\n");
-		return status;
-	}
+	// status = readl_poll_timeout(dsi->iomem + XDSI_STR, val,
+	// 			    !(val & XDSI_STR_CMD_EXE_PGS),
+	// 				1,
+	// 			    XDSI_CMD_TIMEOUT_VAL);
+	// if (status) {
+	// 	dev_err(dsi->dev, "cmd timeout\n");
+	// 	return status;
+	// }
 
 	return msg->tx_len;
 }
@@ -444,8 +703,10 @@ static ssize_t xlnx_dsi_host_transfer(struct mipi_dsi_host *host,
 static int xlnx_dsi_host_attach(struct mipi_dsi_host *host,
 				struct mipi_dsi_device *device)
 {
+	int ret, status;
 	u32 panel_lanes;
 	struct xlnx_dsi *dsi = host_to_dsi(host);
+	u32 val;
 
 	panel_lanes = device->lanes;
 	dsi->mode_flags = device->mode_flags;
@@ -501,8 +762,7 @@ static enum drm_connector_status
 xlnx_dsi_detect(struct drm_connector *connector, bool force)
 {
 	struct xlnx_dsi *dsi = connector_to_dsi(connector);
-	int ret;
-
+	
 	dev_dbg(dsi->dev, "%s\n", __func__);
 
 	if (!dsi->panel)
@@ -605,7 +865,6 @@ xlnx_dsi_atomic_mode_set(struct drm_encoder *encoder,
 	vm->hfront_porch = m->hsync_start - m->hdisplay;
 	vm->hback_porch = m->htotal - m->hsync_end;
 	vm->hsync_len = m->hsync_end - m->hsync_start;
-	xlnx_dsi_set_display_mode(dsi);
 }
 
 static void xlnx_dsi_disable(struct drm_encoder *encoder)
@@ -736,6 +995,10 @@ static int xlnx_dsi_bind(struct device *dev, struct device *master,
 		drm_encoder_cleanup(encoder);
 		return ret;
 	}
+
+	dev_dbg(dsi->dev, "%s - initialial reg dump\n", __func__);
+	register_dump(dsi);
+
 	return 0;
 }
 
@@ -781,6 +1044,11 @@ static int xlnx_dsi_probe(struct platform_device *pdev)
 		return PTR_ERR(dsi->iomem);
 
 	platform_set_drvdata(pdev, dsi);
+
+	/* Reset support */
+	dsi->reset = devm_reset_control_get(dev, "dsi-tx-resetn");
+	if (IS_ERR(dsi->reset))
+    	return PTR_ERR(dsi->reset);
 
 	/* Bridge support */
 	vpss_node = of_parse_phandle(dsi->dev->of_node, "xlnx,vpss", 0);
